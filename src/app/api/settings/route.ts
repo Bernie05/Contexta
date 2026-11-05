@@ -6,7 +6,7 @@ import { errorMessage } from "@/lib/utils";
 
 export async function GET() {
   await connection();
-  return Response.json(publicSettings());
+  return Response.json(await publicSettings());
 }
 
 export async function PUT(req: Request) {
@@ -14,7 +14,7 @@ export async function PUT(req: Request) {
   if (!body || typeof body !== "object") return jsonError(400, "Invalid JSON body.");
   if (body.providers !== undefined && !Array.isArray(body.providers)) return jsonError(400, "providers must be a list.");
   try {
-    return Response.json(updateSettings(body));
+    return Response.json(await updateSettings(body));
   } catch (err) {
     return jsonError(400, errorMessage(err, "Invalid settings."));
   }

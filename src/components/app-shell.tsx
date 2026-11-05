@@ -1,20 +1,24 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { BookOpen, Menu, Settings, X } from "lucide-react";
-import { api, isFileDrag, parseItemKey, readDragItems, type DragItem } from "@/lib/api";
-import { formatForFileName, stripExtension, SUPPORTED_LABEL } from "@/lib/formats/catalog";
+import { api, isFileDrag, MODEL_KEY, parseItemKey, readDragItems, summaryStream, type DragItem } from "@/lib/api";
+import { formatForFileName, formatOf, stripExtension, SUPPORTED_LABEL } from "@/lib/formats/catalog";
 import type { Document, Folder } from "@/lib/types";
-import { errorMessage, groupByParent, pathTo, plural, subtreeIds } from "@/lib/utils";
+import { errorMessage, groupByParent, pathTo, plural, readLocal, subtreeIds } from "@/lib/utils";
 import { FolderTree } from "./folder-tree";
 import { DocumentPane, type ItemAction } from "./document-pane";
 import { ChatBot } from "./chat-panel";
 import { MoveDialog } from "./move-dialog";
 import { NoteEditor } from "./note-editor";
+import { UrlDialog } from "./url-dialog";
 import { SettingsDialog } from "./settings-dialog";
 import { ConfirmDialog, PromptDialog } from "./ui";
 
-type Dialog = ItemAction | { kind: "newFolder"; parentId: string | null } | { kind: "bulkMove" | "bulkDelete" } | null;
+// How long a finished progress bar stays at 100% before the success message replaces it.
+const FULL_BAR_MS = 800;
+
+type Dialog = ItemAction | { kind: "newFolder"; parentId: string | null } | { kind: "bulkMove" | "bulkDelete" | "importUrl" } | null;
 
 export function AppShell() {
   const [folders, setFolders] = useState<Folder[]>([]);
@@ -22,12 +26,13 @@ export function AppShell() {
   const [openId, setCurrentId] = useState<string | null>(null);
   const [dialog, setDialog] = useState<Dialog>(null);
   const [uploading, setUploading] = useState(false);
-  const [notice, setNotice] = useState<{ text: string; tone: "info" | "error" } | null>(null);
+  const [notice, setNotice] = useState<{ text: string; tone: "info" | "error"; percent?: number } | null>(null);
   const [chatPrefill, setChatPrefill] = useState<{ text: string; n: number } | null>(null);
   const [chatOpen, setChatOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [modelsVersion, setModelsVersion] = useState(0);
   const [sidebarOpen, setSidebarOpen] = useState(false); // drawer on small screens
+  const summarizing = useRef(false); // one at a time, so a local model isn't overloaded
   // Note editor: an existing note's id, or a new note (optionally prefilled, e.g. from a chat answer).
   const [noteEditor, setNoteEditor] = useState<{ id?: string; initial?: { title: string; content: string } } | null>(null);
   // Selection belongs to the folder it was made in; opening another folder starts empty.
@@ -134,7 +139,36 @@ export function AppShell() {
     }
   }
 
+  async function summarize(doc: Document) {
+    if (summarizing.current) return flash("A summary is already being created.", "error");
+    summarizing.current = true;
+    const status = `Summarizing "${doc.name}"…`;
+    setNotice({ text: status, tone: "info", percent: 0 });
+    try {
+      let created: Document | undefined;
+      for await (const event of summaryStream(doc.id, readLocal(MODEL_KEY))) {
+        if (event.type === "error") throw new Error(event.error);
+        if (event.type === "done") created = event.document;
+        else setNotice({ text: event.part ? `${status} part ${event.part} of ${event.total}` : status, tone: "info", percent: event.percent });
+      }
+      if (!created) throw new Error("The summary stopped before it finished.");
+      setNotice({ text: status, tone: "info", percent: 100 });
+      await refresh();
+      await new Promise((resolve) => setTimeout(resolve, FULL_BAR_MS));
+      flash(
+        created.kind === doc.kind
+          ? `Summary created: "${created.name}".`
+          : `Summary created as a note: "${created.name}". A ${formatOf(doc.kind).label} can't show this text.`,
+      );
+    } catch (err) {
+      flashError(err, "Couldn't create the summary.");
+    } finally {
+      summarizing.current = false;
+    }
+  }
+
   async function handleAction(action: ItemAction) {
+    if (action.kind === "summarize") return summarize(action.doc);
     if (action.kind === "newSubfolder") {
       setDialog({ kind: "newFolder", parentId: action.folder.id });
       return;
@@ -237,6 +271,7 @@ export function AppShell() {
             onOpenFolder={setCurrentId}
             onNewFolder={() => setDialog({ kind: "newFolder", parentId: currentId })}
             onNewNote={() => setNoteEditor({})}
+            onImportUrl={() => setDialog({ kind: "importUrl" })}
             onUpload={(files) => upload(files, currentId)}
             onDrop={handleDrop}
             onAction={handleAction}
@@ -304,10 +339,34 @@ export function AppShell() {
         <div
           role="status"
           className={`fixed bottom-4 left-1/2 z-50 flex max-w-[calc(100%-2rem)] -translate-x-1/2 items-center gap-3 rounded-lg px-4 py-2 text-sm shadow-lg ${
+            notice.percent !== undefined ? "w-96" : ""
+          } ${
             notice.tone === "error" ? "bg-danger text-white dark:text-black" : "bg-foreground text-background"
           }`}
         >
-          <span>{notice.text}</span>
+          <div className="min-w-0 flex-1">
+            <span>{notice.text}</span>
+            {notice.percent !== undefined && (
+              <div className="mt-1.5 flex items-center gap-2">
+                <div
+                  role="progressbar"
+                  aria-label="Summary progress"
+                  aria-valuenow={notice.percent}
+                  aria-valuemin={0}
+                  aria-valuemax={100}
+                  className="h-1.5 flex-1 overflow-hidden rounded-full bg-background/25"
+                >
+                  <div
+                    className="h-full rounded-full bg-background transition-[width] duration-300"
+                    style={{ width: `${notice.percent}%` }}
+                  />
+                </div>
+                <span aria-hidden className="w-9 text-right text-xs tabular-nums">
+                  {notice.percent}%
+                </span>
+              </div>
+            )}
+          </div>
           <button onClick={() => setNotice(null)} aria-label="Dismiss">
             <X size={14} />
           </button>
@@ -322,6 +381,21 @@ export function AppShell() {
           onSubmit={async (name) => {
             await api.createFolder(name, dialog.parentId);
             await refresh();
+          }}
+          onClose={close}
+        />
+      )}
+      {dialog?.kind === "importUrl" && (
+        <UrlDialog
+          folderName={current?.name ?? "Library"}
+          onSubmit={async (url, kind) => {
+            const doc = await api.importUrl({ url, kind, folderId: currentId });
+            await refresh();
+            flash(
+              doc.kind === kind
+                ? `Saved "${doc.name}". Indexing…`
+                : `Saved as a note: "${doc.name}". A ${formatOf(kind).label} can't show this text.`,
+            );
           }}
           onClose={close}
         />

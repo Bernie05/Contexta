@@ -24,9 +24,18 @@ export interface ExtractedText {
   parts: string[];
 }
 
+/** Generated text to save as a file. */
+export interface WrittenDocument {
+  title: string;
+  subtitle: string; // where it came from, e.g. "Summary of report.pdf"
+  markdown: string;
+}
+
 export interface FormatExtractor {
   meta: FormatMeta;
   /** Checks the file's signature bytes, so a renamed file can't pose as this format. */
   sniff: (bytes: Uint8Array) => boolean;
   extract: (bytes: Uint8Array) => Promise<ExtractedText>;
+  /** Creates a file in this format, or returns null if the format can't show the text. */
+  write: (doc: WrittenDocument) => Promise<Uint8Array | null>;
 }

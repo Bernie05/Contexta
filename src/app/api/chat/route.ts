@@ -1,8 +1,7 @@
 import { formatOf } from "@/lib/formats/catalog";
-import { jsonError, readJson } from "@/lib/http";
+import { jsonError, ndjsonResponse, readJson } from "@/lib/http";
 import { parseModelId, streamAnswer, type ChatTurn } from "@/lib/llm";
 import { retrieve, type Source } from "@/lib/retrieval";
-import { errorMessage } from "@/lib/utils";
 
 const HISTORY_TURNS = 6;
 const MAX_QUESTION_CHARS = 4000;
@@ -41,51 +40,31 @@ export async function POST(req: Request) {
   if (question.content.length > MAX_QUESTION_CHARS) return jsonError(400, "Question is too long.");
 
   const folderId = typeof body?.folderId === "string" ? body.folderId : null;
-  const encoder = new TextEncoder();
 
-  const stream = new ReadableStream<Uint8Array>({
-    async start(controller) {
-      const send = (event: object) => controller.enqueue(encoder.encode(JSON.stringify(event) + "\n"));
-      try {
-        // The previous question gives follow-ups ("and the battery?") their context.
-        const previousQuestion = history.slice(0, -1).findLast((m) => m.role === "user")?.content;
-        const { documents, sources } = await retrieve(question.content, folderId, previousQuestion);
-        send({ type: "routing", documents });
-        send({ type: "sources", sources: sources.map(({ text, ...s }) => ({ ...s, snippet: text.slice(0, 280) })) });
+  return ndjsonResponse(req, "chat", async (send) => {
+    // The previous question gives follow-ups ("and the battery?") their context.
+    const previousQuestion = history.slice(0, -1).findLast((m) => m.role === "user")?.content;
+    const { documents, sources } = await retrieve(question.content, folderId, previousQuestion);
+    send({ type: "routing", documents });
+    send({ type: "sources", sources: sources.map(({ text, ...s }) => ({ ...s, snippet: text.slice(0, 280) })) });
 
-        if (sources.length === 0) {
-          send({ type: "text", text: "There are no indexed documents yet. Upload a PDF or Word file, or wait for indexing to finish." });
-          send({ type: "done" });
-          return;
-        }
+    if (sources.length === 0) {
+      send({ type: "text", text: "There are no indexed documents yet. Upload a PDF or Word file, or wait for indexing to finish." });
+      send({ type: "done" });
+      return;
+    }
 
-        // Earlier turns stay as plain text; only the newest question carries the excerpts.
-        const messages: ChatTurn[] = [
-          ...history.slice(0, -1),
-          { role: "user", content: `Excerpts:\n\n${buildContext(sources)}\n\nQuestion: ${question.content}` },
-        ];
-        // Anthropic requires the conversation to start with a user turn.
-        while (messages.length > 1 && messages[0].role !== "user") messages.shift();
+    // Earlier turns stay as plain text; only the newest question carries the excerpts.
+    const messages: ChatTurn[] = [
+      ...history.slice(0, -1),
+      { role: "user", content: `Excerpts:\n\n${buildContext(sources)}\n\nQuestion: ${question.content}` },
+    ];
+    // Anthropic requires the conversation to start with a user turn.
+    while (messages.length > 1 && messages[0].role !== "user") messages.shift();
 
-        for await (const text of streamAnswer(parsed, SYSTEM, messages, req.signal)) {
-          send({ type: "text", text });
-        }
-        send({ type: "done" });
-      } catch (err) {
-        if (req.signal.aborted) return;
-        console.error("[chat]", err);
-        send({ type: "error", error: errorMessage(err) });
-      } finally {
-        try {
-          controller.close();
-        } catch {
-          // already closed by a client disconnect
-        }
-      }
-    },
-  });
-
-  return new Response(stream, {
-    headers: { "Content-Type": "application/x-ndjson; charset=utf-8", "Cache-Control": "no-cache" },
+    for await (const text of streamAnswer(parsed, SYSTEM, messages, req.signal)) {
+      send({ type: "text", text });
+    }
+    send({ type: "done" });
   });
 }

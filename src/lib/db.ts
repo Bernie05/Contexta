@@ -1,8 +1,9 @@
 import "server-only";
-import { DatabaseSync } from "node:sqlite";
 import fs from "node:fs";
 import path from "node:path";
+import { Pool, types, type PoolConfig, type QueryResultRow } from "pg";
 import type { DocKind } from "./formats/types";
+import { SCHEMA } from "./schema";
 import type { Document, Folder } from "./types";
 
 export type { DocStatus, Document, Folder } from "./types";
@@ -10,86 +11,93 @@ export type { DocStatus, Document, Folder } from "./types";
 // Runtime data lives outside the build; tell Turbopack not to trace it.
 export const DATA_DIR = path.resolve(/*turbopackIgnore: true*/ process.env.CONTEXTA_DATA_DIR ?? "./data");
 export const FILES_DIR = path.join(DATA_DIR, "files");
+const PGLITE_DIR = path.join(DATA_DIR, "pg");
 
-const SCHEMA = `
-PRAGMA journal_mode = WAL;
-PRAGMA foreign_keys = ON;
+// Timestamps stay ISO strings, matching Document and Folder.
+types.setTypeParser(types.builtins.TIMESTAMPTZ, (value) => new Date(value).toISOString());
 
-CREATE TABLE IF NOT EXISTS folders (
-  id         TEXT PRIMARY KEY,
-  name       TEXT NOT NULL,
-  parent_id  TEXT REFERENCES folders(id) ON DELETE CASCADE,
-  created_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
-CREATE TABLE IF NOT EXISTS documents (
-  id          TEXT PRIMARY KEY,
-  name        TEXT NOT NULL,
-  kind        TEXT NOT NULL DEFAULT 'pdf',
-  folder_id   TEXT REFERENCES folders(id) ON DELETE CASCADE,
-  size        INTEGER NOT NULL,
-  page_count  INTEGER, -- number of citable parts: pages (PDF) or sections (Word)
-  chunk_count INTEGER NOT NULL DEFAULT 0,
-  status      TEXT NOT NULL DEFAULT 'queued',
-  error       TEXT,
-  created_at  TEXT NOT NULL DEFAULT (datetime('now'))
-);
-CREATE INDEX IF NOT EXISTS idx_documents_folder ON documents(folder_id);
-
-CREATE TABLE IF NOT EXISTS chunks (
-  id          INTEGER PRIMARY KEY AUTOINCREMENT,
-  document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
-  page        INTEGER NOT NULL,
-  idx         INTEGER NOT NULL,
-  text        TEXT NOT NULL,
-  embedding   BLOB NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_chunks_document ON chunks(document_id);
-
-CREATE TABLE IF NOT EXISTS settings (
-  key   TEXT PRIMARY KEY,
-  value TEXT NOT NULL
-);
-`;
-
-/** Brings databases created by earlier versions up to the current schema. */
-function migrate(conn: DatabaseSync) {
-  const cols = conn.prepare("PRAGMA table_info(documents)").all() as { name: string }[];
-  if (!cols.some((c) => c.name === "kind")) {
-    conn.exec("ALTER TABLE documents ADD COLUMN kind TEXT NOT NULL DEFAULT 'pdf'");
+function isRunning(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "EPERM";
   }
 }
 
-function applySchema(conn: DatabaseSync) {
-  conn.exec(SCHEMA);
-  migrate(conn);
+/** PGlite lets a second process open its folder, and two writers would corrupt it. */
+function claimPgliteDir() {
+  const lock = path.join(DATA_DIR, "pg.lock");
+  const owner = fs.existsSync(lock) ? Number(fs.readFileSync(lock, "utf8")) : 0;
+  if (owner && owner !== process.pid && isRunning(owner)) {
+    throw new Error(`The local database is in use by process ${owner}. Stop that app first, or delete ${lock} if it isn't Contexta.`);
+  }
+  fs.writeFileSync(lock, String(process.pid));
 }
 
-// Reuse one connection across hot reloads in dev.
-const globalForDb = globalThis as unknown as { contextaDb?: DatabaseSync };
-// Module-scoped so a hot reload re-applies the (idempotent) schema to the reused connection.
-let schemaApplied = false;
+/** DATABASE_URL picks a Postgres server; without it the app runs Postgres in-process with PGlite. */
+async function poolConfig(): Promise<PoolConfig> {
+  if (process.env.DATABASE_URL) return { connectionString: process.env.DATABASE_URL };
 
-export function db(): DatabaseSync {
-  if (!globalForDb.contextaDb) {
-    fs.mkdirSync(FILES_DIR, { recursive: true });
-    const conn = new DatabaseSync(path.join(DATA_DIR, "contexta.db"));
-    applySchema(conn);
-    schemaApplied = true;
-    // Documents interrupted mid-index by a restart are re-queued by the indexer.
-    conn.exec("UPDATE documents SET status = 'queued' WHERE status = 'processing'");
-    globalForDb.contextaDb = conn;
-  }
-  if (!schemaApplied) {
-    applySchema(globalForDb.contextaDb);
-    schemaApplied = true;
-  }
+  claimPgliteDir();
+  const [{ PGlite }, { createPgConfig }, { vector }] = await Promise.all([
+    import("@electric-sql/pglite"),
+    import("@electric-sql/pglite/node-postgres"),
+    import("@electric-sql/pglite-pgvector"),
+  ]);
+  const lite = await PGlite.create(PGLITE_DIR, { extensions: { vector } });
+  return createPgConfig(lite) as PoolConfig;
+}
+
+async function connect(): Promise<Pool> {
+  fs.mkdirSync(FILES_DIR, { recursive: true });
+  const pool = new Pool(await poolConfig());
+  pool.on("error", (err) => console.error("[db] idle connection failed:", err));
+  await pool.query(SCHEMA);
+  // Documents interrupted mid-index by a restart are re-queued by the indexer.
+  await pool.query("UPDATE documents SET status = 'queued' WHERE status = 'processing'");
+  return pool;
+}
+
+// Reuse one connection across hot reloads in dev. A failed connect isn't kept, so the next call retries.
+const globalForDb = globalThis as unknown as { contextaDb?: Promise<Pool> };
+
+function pool(): Promise<Pool> {
+  globalForDb.contextaDb ??= connect().catch((err) => {
+    globalForDb.contextaDb = undefined;
+    throw err;
+  });
   return globalForDb.contextaDb;
 }
 
-/** "?,?,?" for a SQL IN (...) list of the given values. */
-export function placeholders(values: readonly unknown[]): string {
-  return values.map(() => "?").join(",");
+export async function query<T extends QueryResultRow>(sql: string, params?: unknown[]): Promise<T[]> {
+  return (await (await pool()).query<T>(sql, params)).rows;
+}
+
+export async function queryOne<T extends QueryResultRow>(sql: string, params?: unknown[]): Promise<T | undefined> {
+  return (await query<T>(sql, params))[0];
+}
+
+export interface Transaction {
+  query: (sql: string, params?: unknown[]) => Promise<unknown>;
+}
+
+/**
+ * Runs `work` atomically. Use `tx` for every query inside it: PGlite has a single
+ * connection, so a plain query() would wait forever for this transaction to end.
+ */
+export async function transaction(work: (tx: Transaction) => Promise<void>): Promise<void> {
+  const client = await (await pool()).connect();
+  try {
+    await client.query("BEGIN");
+    await work({ query: (sql, params) => client.query(sql, params) });
+    await client.query("COMMIT");
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
 }
 
 /** Stored files are named <id>.<kind>, e.g. "3f2a….docx". */
@@ -97,45 +105,39 @@ export function filePath(documentId: string, kind: DocKind): string {
   return path.join(FILES_DIR, `${documentId}.${kind}`);
 }
 
-export function listFolders(): Folder[] {
-  return db().prepare("SELECT * FROM folders ORDER BY name COLLATE NOCASE").all() as unknown as Folder[];
+export function listFolders(): Promise<Folder[]> {
+  return query<Folder & QueryResultRow>("SELECT * FROM folders ORDER BY lower(name)");
 }
 
-export function listDocuments(): Document[] {
-  return db()
-    .prepare(
-      `SELECT id, name, kind, folder_id, size, page_count, chunk_count, status, error, created_at
-       FROM documents ORDER BY created_at DESC`,
-    )
-    .all() as unknown as Document[];
+export function listDocuments(): Promise<Document[]> {
+  return query<Document & QueryResultRow>(
+    `SELECT id, name, kind, folder_id, size, page_count, chunk_count, status, error, created_at
+     FROM documents ORDER BY created_at DESC`,
+  );
 }
 
-export function getDocument(id: string): Document | undefined {
-  return db().prepare("SELECT * FROM documents WHERE id = ?").get(id) as unknown as Document | undefined;
+export function getDocument(id: string): Promise<Document | undefined> {
+  return queryOne<Document & QueryResultRow>("SELECT * FROM documents WHERE id = $1", [id]);
 }
 
-export function getFolder(id: string): Folder | undefined {
-  return db().prepare("SELECT * FROM folders WHERE id = ?").get(id) as unknown as Folder | undefined;
+export function getFolder(id: string): Promise<Folder | undefined> {
+  return queryOne<Folder & QueryResultRow>("SELECT * FROM folders WHERE id = $1", [id]);
 }
 
 /** All folder ids in the subtree rooted at `folderId` (inclusive). */
-export function folderSubtree(folderId: string): string[] {
-  const rows = db()
-    .prepare(
-      `WITH RECURSIVE tree(id) AS (
-         SELECT id FROM folders WHERE id = ?
-         UNION ALL
-         SELECT f.id FROM folders f JOIN tree t ON f.parent_id = t.id
-       ) SELECT id FROM tree`,
-    )
-    .all(folderId) as { id: string }[];
+export async function folderSubtree(folderId: string): Promise<string[]> {
+  const rows = await query<{ id: string }>(
+    `WITH RECURSIVE tree(id) AS (
+       SELECT id FROM folders WHERE id = $1
+       UNION ALL
+       SELECT f.id FROM folders f JOIN tree t ON f.parent_id = t.id
+     ) SELECT id FROM tree`,
+    [folderId],
+  );
   return rows.map((r) => r.id);
 }
 
 /** Documents in the given folders, used before a delete so their files can be removed too. */
-export function documentsInFolders(folderIds: string[]): { id: string; kind: DocKind }[] {
-  if (folderIds.length === 0) return [];
-  return db()
-    .prepare(`SELECT id, kind FROM documents WHERE folder_id IN (${placeholders(folderIds)})`)
-    .all(...folderIds) as unknown as { id: string; kind: DocKind }[];
+export function documentsInFolders(folderIds: string[]): Promise<{ id: string; kind: DocKind }[]> {
+  return query<{ id: string; kind: DocKind }>("SELECT id, kind FROM documents WHERE folder_id = ANY($1)", [folderIds]);
 }

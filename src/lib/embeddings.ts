@@ -29,14 +29,9 @@ export async function embed(texts: string[], batchSize = 16): Promise<Float32Arr
   return out;
 }
 
-export function toBlob(vec: Float32Array): Uint8Array {
-  return new Uint8Array(vec.buffer, vec.byteOffset, vec.byteLength);
-}
-
-export function fromBlob(blob: Uint8Array): Float32Array {
-  // Copy so the Float32Array is aligned regardless of the source buffer offset.
-  const copy = new Uint8Array(blob);
-  return new Float32Array(copy.buffer);
+/** A vector in pgvector's text format, e.g. "[0.1,0.2]". */
+export function toVectorLiteral(vec: Float32Array): string {
+  return `[${vec.join(",")}]`;
 }
 
 export function dot(a: Float32Array, b: Float32Array): number {

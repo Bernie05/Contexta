@@ -11,7 +11,7 @@ import { jsonError } from "@/lib/http";
 export async function GET(_req: Request, ctx: RouteContext<"/api/documents/[id]/file">) {
   await connection();
   const { id } = await ctx.params;
-  const doc = getDocument(id);
+  const doc = await getDocument(id);
   if (!doc) return jsonError(404, "Document not found.");
 
   const bytes = await fs.readFile(filePath(id, doc.kind)).catch(() => null);

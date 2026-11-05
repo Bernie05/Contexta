@@ -3,9 +3,11 @@ import mammoth from "mammoth";
 import { groupIntoSections, splitParagraphs } from "../sections";
 import type { FormatExtractor } from "../types";
 import { docxMeta } from "./meta";
+import { writeDocx } from "./write";
 
 export const docxExtractor: FormatExtractor = {
   meta: docxMeta,
+  write: writeDocx,
 
   // .docx is a ZIP archive ("PK\x03\x04"); mammoth rejects ZIPs that aren't Word files.
   sniff: (bytes) => bytes[0] === 0x50 && bytes[1] === 0x4b && bytes[2] === 0x03 && bytes[3] === 0x04,

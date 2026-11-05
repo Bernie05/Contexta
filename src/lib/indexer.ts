@@ -1,8 +1,8 @@
 import "server-only";
 import fs from "node:fs/promises";
-import { db, filePath, getDocument } from "./db";
+import { filePath, getDocument, query, queryOne, transaction } from "./db";
 import { chunkParts } from "./chunk";
-import { embed, toBlob } from "./embeddings";
+import { embed, toVectorLiteral } from "./embeddings";
 import { extractorFor } from "./formats/registry";
 import { errorMessage } from "./utils";
 
@@ -17,8 +17,8 @@ export function enqueue(documentId: string) {
 }
 
 /** Re-queues documents left unindexed by a previous run. Called once at server start. */
-export function resumeQueue() {
-  const rows = db().prepare("SELECT id FROM documents WHERE status = 'queued' ORDER BY created_at").all() as { id: string }[];
+export async function resumeQueue() {
+  const rows = await query<{ id: string }>("SELECT id FROM documents WHERE status = 'queued' ORDER BY created_at");
   rows.forEach((r) => enqueue(r.id));
 }
 
@@ -33,15 +33,15 @@ async function drain() {
   }
 }
 
-const exists = (id: string) => Boolean(db().prepare("SELECT 1 FROM documents WHERE id = ?").get(id));
+const exists = async (id: string) => Boolean(await queryOne("SELECT 1 FROM documents WHERE id = $1", [id]));
+const setStatus = (id: string, status: string, error: string | null) =>
+  query("UPDATE documents SET status = $1, error = $2 WHERE id = $3", [status, error, id]);
 
 async function indexDocument(id: string) {
-  const conn = db();
-  const doc = getDocument(id);
+  const doc = await getDocument(id);
   if (!doc) return; // deleted while waiting in the queue
 
-  const setStatus = conn.prepare("UPDATE documents SET status = ?, error = ? WHERE id = ?");
-  setStatus.run("processing", null, id);
+  await setStatus(id, "processing", null);
   try {
     const extractor = extractorFor(doc.kind);
     const bytes = new Uint8Array(await fs.readFile(filePath(id, doc.kind)));
@@ -58,23 +58,27 @@ async function indexDocument(id: string) {
     }
 
     const vectors = chunks.length ? await embed(chunks.map((c) => c.text)) : [];
-    if (!exists(id)) return; // deleted while it was being embedded
+    if (!(await exists(id))) return; // deleted while it was being embedded
 
-    const insert = conn.prepare("INSERT INTO chunks (document_id, page, idx, text, embedding) VALUES (?, ?, ?, ?, ?)");
-    conn.exec("BEGIN");
-    try {
-      conn.prepare("DELETE FROM chunks WHERE document_id = ?").run(id);
-      chunks.forEach((c, i) => insert.run(id, c.page, c.idx, c.text, toBlob(vectors[i])));
-      conn
-        .prepare("UPDATE documents SET status = 'ready', error = NULL, page_count = ?, chunk_count = ? WHERE id = ?")
-        .run(parts.length, chunks.length, id);
-      conn.exec("COMMIT");
-    } catch (err) {
-      conn.exec("ROLLBACK");
-      throw err;
-    }
+    await transaction(async (tx) => {
+      await tx.query("DELETE FROM chunks WHERE document_id = $1", [id]);
+      for (const [i, c] of chunks.entries()) {
+        await tx.query("INSERT INTO chunks (document_id, chunk_index, page, content, embedding) VALUES ($1, $2, $3, $4, $5)", [
+          id,
+          c.idx,
+          c.page,
+          c.text,
+          toVectorLiteral(vectors[i]),
+        ]);
+      }
+      await tx.query("UPDATE documents SET status = 'ready', error = NULL, page_count = $1, chunk_count = $2 WHERE id = $3", [
+        parts.length,
+        chunks.length,
+        id,
+      ]);
+    });
   } catch (err) {
     console.error(`[indexer] ${id} failed:`, err);
-    if (exists(id)) setStatus.run("error", errorMessage(err, String(err)), id);
+    if (await exists(id)) await setStatus(id, "error", errorMessage(err, String(err)));
   }
 }

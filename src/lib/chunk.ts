@@ -16,7 +16,8 @@ export function chunkParts(parts: string[]): Chunk[] {
   const chunks: Chunk[] = [];
   let idx = 0;
   parts.forEach((raw, i) => {
-    const text = raw.replace(/\s+/g, " ").trim();
+    // PDF text can contain NUL characters, which Postgres can't store.
+    const text = raw.replaceAll("\0", "").replace(/\s+/g, " ").trim();
     let start = 0;
     while (start < text.length) {
       let end = Math.min(start + CHUNK_CHARS, text.length);

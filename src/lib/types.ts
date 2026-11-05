@@ -30,7 +30,7 @@ export interface RoutedDoc {
   id: string;
   name: string;
   score: number;
-  reasons: ("content" | "name" | "folder")[];
+  reasons: ("content" | "keyword" | "name" | "folder")[];
 }
 
 export interface SourceRef {

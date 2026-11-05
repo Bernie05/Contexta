@@ -1,6 +1,6 @@
 import "server-only";
-import { db, folderSubtree, placeholders } from "./db";
-import { dot, embed, fromBlob } from "./embeddings";
+import { folderSubtree, query, queryOne } from "./db";
+import { dot, embed, toVectorLiteral } from "./embeddings";
 import { stripExtension, type DocKind } from "./formats/catalog";
 import type { RoutedDoc } from "./types";
 
@@ -14,13 +14,16 @@ export interface Source {
   score: number;
 }
 
-/** Light per-chunk row: no text, no vector. */
-interface ChunkMeta {
-  id: number;
+/** A chunk found by vector or keyword search. `score` is always its cosine similarity. */
+interface Candidate {
   document_id: string;
   document_name: string;
   kind: DocKind;
   folder_id: string | null;
+  page: number;
+  content: string;
+  score: number;
+  keyword_rank: number | null; // 1 is the best keyword match, null means no keyword match
 }
 
 // Auto routing: how many documents may answer, and how close to the best one they must score.
@@ -29,20 +32,19 @@ const ROUTE_MARGIN = 0.12;
 const MIN_DOC_SCORE = 0.2;
 const NAME_BOOST = 0.15;
 const FOLDER_BOOST = 0.05;
+// Added to a document's score, divided by its best keyword rank, so exact terms can pick it.
+const KEYWORD_BOOST = 0.15;
 // Weight of the previous question when embedding a follow-up ("and the battery?").
 const PREVIOUS_QUESTION_WEIGHT = 0.4;
-const SQL_BATCH = 500;
-
-// Decoded vectors by chunk id, kept across questions. Chunk ids are never reused
-// (AUTOINCREMENT), so a cached vector can't go stale; deleted chunks are pruned.
-const globalForCache = globalThis as unknown as { contextaVectors?: Map<number, Float32Array> };
-const vectors = (globalForCache.contextaVectors ??= new Map());
+// Per search. pgvector's HNSW index returns at most 40 rows unless hnsw.ef_search is raised.
+const CANDIDATES = 40;
+// Reciprocal rank fusion constant: the usual default, which keeps one list from dominating.
+const RRF_K = 60;
 
 /**
  * Finds the chunks that best answer `question` across the whole library: it first
- * predicts which documents are needed, then searches only those. `contextFolderId`
- * is the folder the user has open, used as a small hint. Brute-force cosine search
- * over cached vectors, which is fine for a personal library.
+ * predicts which documents are needed, then keeps only their chunks. `contextFolderId`
+ * is the folder the user has open, used as a small hint.
  */
 export async function retrieve(
   question: string,
@@ -50,60 +52,67 @@ export async function retrieve(
   previousQuestion?: string,
   k = 6,
 ): Promise<{ documents: RoutedDoc[]; sources: Source[] }> {
-  const rows = db()
-    .prepare(
-      `SELECT c.id, c.document_id, d.name AS document_name, d.kind, d.folder_id
-       FROM chunks c JOIN documents d ON d.id = c.document_id
-       WHERE d.status = 'ready'`,
-    )
-    .all() as unknown as ChunkMeta[];
-  if (rows.length === 0) return { documents: [], sources: [] };
-
-  syncVectors(rows);
-  const q = await queryVector(question, previousQuestion);
-  const scored = rows.map((row) => ({ row, score: dot(q, vectors.get(row.id)!) }));
-
-  const documents = routeDocuments(scored, question, contextFolderId);
-  const picked = new Set(documents.map((d) => d.id));
-  const top = scored
-    .filter((s) => picked.has(s.row.document_id))
-    .sort((a, b) => b.score - a.score)
-    .slice(0, k);
-
-  // Only the winning chunks need their text.
-  const details = new Map(
-    (db()
-      .prepare(`SELECT id, page, text FROM chunks WHERE id IN (${placeholders(top)})`)
-      .all(...top.map((t) => t.row.id)) as { id: number; page: number; text: string }[]).map((r) => [r.id, r]),
+  // Checked first so an empty library never loads the embedding model.
+  const hasChunks = await queryOne(
+    "SELECT 1 FROM chunks c JOIN documents d ON d.id = c.document_id WHERE d.status = 'ready' LIMIT 1",
   );
+  if (!hasChunks) return { documents: [], sources: [] };
 
-  const sources = top.map(({ row, score }, i) => ({
-    n: i + 1,
-    documentId: row.document_id,
-    documentName: row.document_name,
-    documentKind: row.kind,
-    page: details.get(row.id)!.page,
-    text: details.get(row.id)!.text,
-    score,
-  }));
+  const candidates = await searchChunks(question, await queryVector(question, previousQuestion));
+  if (candidates.length === 0) return { documents: [], sources: [] };
+
+  const documents = await routeDocuments(candidates, question, contextFolderId);
+  const picked = new Set(documents.map((d) => d.id));
+  const sources = fuse(candidates)
+    .filter((c) => picked.has(c.document_id))
+    .slice(0, k)
+    .map((c, i) => ({
+      n: i + 1,
+      documentId: c.document_id,
+      documentName: c.document_name,
+      documentKind: c.kind,
+      page: c.page,
+      text: c.content,
+      score: c.score,
+    }));
 
   return { documents, sources };
 }
 
-/** Loads vectors for chunks not yet cached and drops ones whose chunks are gone. */
-function syncVectors(rows: ChunkMeta[]) {
-  const missing = rows.filter((r) => !vectors.has(r.id)).map((r) => r.id);
-  for (let i = 0; i < missing.length; i += SQL_BATCH) {
-    const batch = missing.slice(i, i + SQL_BATCH);
-    const loaded = db()
-      .prepare(`SELECT id, embedding FROM chunks WHERE id IN (${placeholders(batch)})`)
-      .all(...batch) as { id: number; embedding: Uint8Array }[];
-    for (const r of loaded) vectors.set(r.id, fromBlob(r.embedding));
-  }
-  if (vectors.size > rows.length) {
-    const live = new Set(rows.map((r) => r.id));
-    for (const id of vectors.keys()) if (!live.has(id)) vectors.delete(id);
-  }
+/**
+ * Hybrid search: the nearest chunks by meaning plus the best keyword matches,
+ * best cosine first. Question words are OR-ed because a chunk rarely holds them all.
+ */
+function searchChunks(question: string, vector: Float32Array): Promise<Candidate[]> {
+  return query<Candidate & { [key: string]: unknown }>(
+    `WITH semantic AS (
+       SELECT id FROM chunks ORDER BY embedding <=> $1::vector LIMIT $3
+     ),
+     keyword AS (
+       SELECT id, row_number() OVER (ORDER BY ts_rank_cd(fts, search.q) DESC, id)::int AS rank
+       FROM chunks
+       CROSS JOIN (SELECT replace(plainto_tsquery('english', $2)::text, '&', '|')::tsquery AS q) AS search
+       WHERE fts @@ search.q
+       ORDER BY rank LIMIT $3
+     )
+     SELECT c.document_id, d.name AS document_name, d.kind, d.folder_id, c.page, c.content,
+            1 - (c.embedding <=> $1::vector) AS score, k.rank AS keyword_rank
+     FROM chunks c
+     JOIN documents d ON d.id = c.document_id
+     LEFT JOIN keyword k ON k.id = c.id
+     WHERE d.status = 'ready' AND (k.id IS NOT NULL OR c.id IN (SELECT id FROM semantic))
+     ORDER BY score DESC`,
+    [toVectorLiteral(vector), question, CANDIDATES],
+  );
+}
+
+/** Orders candidates by reciprocal rank fusion of their vector and keyword ranks. */
+function fuse(candidates: Candidate[]): Candidate[] {
+  const fused = candidates.map((c, i) => ({
+    c,
+    rank: 1 / (RRF_K + i + 1) + (c.keyword_rank ? 1 / (RRF_K + c.keyword_rank) : 0),
+  }));
+  return fused.sort((a, b) => b.rank - a.rank).map(({ c }) => c);
 }
 
 async function queryVector(question: string, previousQuestion?: string): Promise<Float32Array> {
@@ -116,24 +125,31 @@ async function queryVector(question: string, previousQuestion?: string): Promise
 
 /**
  * Predicts which documents the question needs: each document is scored by its
- * best matching chunks, with small boosts when the question names the file or
- * the file sits in the folder the user has open.
+ * best matching chunks, with small boosts when its text has the question's words,
+ * the question names the file, or the file sits in the folder the user has open.
  */
-function routeDocuments(
-  scored: { row: ChunkMeta; score: number }[],
+async function routeDocuments(
+  candidates: Candidate[],
   question: string,
   contextFolderId: string | null,
-): RoutedDoc[] {
+): Promise<RoutedDoc[]> {
   // Track the two best chunk scores per document; no need to keep or sort them all.
-  const byDoc = new Map<string, { name: string; folderId: string | null; top1: number; top2: number }>();
-  for (const { row, score } of scored) {
-    const d = byDoc.get(row.document_id);
-    if (!d) byDoc.set(row.document_id, { name: row.document_name, folderId: row.folder_id, top1: score, top2: -Infinity });
-    else if (score > d.top1) [d.top2, d.top1] = [d.top1, score];
+  const byDoc = new Map<
+    string,
+    { name: string; folderId: string | null; top1: number; top2: number; keywordRank: number | null }
+  >();
+  for (const { document_id, document_name, folder_id, score, keyword_rank } of candidates) {
+    const d = byDoc.get(document_id);
+    if (!d) {
+      byDoc.set(document_id, { name: document_name, folderId: folder_id, top1: score, top2: -Infinity, keywordRank: keyword_rank });
+      continue;
+    }
+    if (score > d.top1) [d.top2, d.top1] = [d.top1, score];
     else if (score > d.top2) d.top2 = score;
+    if (keyword_rank && (!d.keywordRank || keyword_rank < d.keywordRank)) d.keywordRank = keyword_rank;
   }
 
-  const contextFolders = new Set(contextFolderId ? folderSubtree(contextFolderId) : []);
+  const contextFolders = new Set(contextFolderId ? await folderSubtree(contextFolderId) : []);
   const words = tokenize(question);
 
   const ranked = [...byDoc.entries()].map(([id, d]) => {
@@ -141,6 +157,10 @@ function routeDocuments(
     let score = 0.7 * d.top1 + 0.3 * top2;
     const reasons: RoutedDoc["reasons"] = ["content"];
 
+    if (d.keywordRank) {
+      score += KEYWORD_BOOST / d.keywordRank;
+      reasons.push("keyword");
+    }
     const nameWords = new Set(tokenize(stripExtension(d.name)));
     const hits = words.filter((w) => nameWords.has(w)).length;
     if (hits > 0) {

@@ -16,7 +16,7 @@ export async function POST(req: Request) {
 
   const folderIdRaw = form.get("folderId");
   const folderId = typeof folderIdRaw === "string" && folderIdRaw ? folderIdRaw : null;
-  if (folderId && !getFolder(folderId)) return jsonError(404, "Folder not found.");
+  if (folderId && !(await getFolder(folderId))) return jsonError(404, "Folder not found.");
 
   const files = form.getAll("files").filter((f): f is File => f instanceof File);
   if (files.length === 0) return jsonError(400, "No files uploaded.");

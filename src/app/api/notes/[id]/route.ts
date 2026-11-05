@@ -5,8 +5,8 @@ import { cleanName, jsonError, readJson } from "@/lib/http";
 import { MAX_NOTE_CHARS } from "@/lib/formats/note/meta";
 import { replaceContent } from "@/lib/library";
 
-function findNote(id: string) {
-  const doc = getDocument(id);
+async function findNote(id: string) {
+  const doc = await getDocument(id);
   return doc?.kind === "note" ? doc : undefined;
 }
 
@@ -14,7 +14,7 @@ function findNote(id: string) {
 export async function GET(_req: Request, ctx: RouteContext<"/api/notes/[id]">) {
   await connection();
   const { id } = await ctx.params;
-  const note = findNote(id);
+  const note = await findNote(id);
   if (!note) return jsonError(404, "Note not found.");
   const content = await fs.readFile(filePath(id, "note"), "utf8").catch(() => "");
   return Response.json({ ...note, content });
@@ -23,7 +23,7 @@ export async function GET(_req: Request, ctx: RouteContext<"/api/notes/[id]">) {
 /** Saves a note: { title?, content }. The note is re-indexed so the assistant sees the change. */
 export async function PUT(req: Request, ctx: RouteContext<"/api/notes/[id]">) {
   const { id } = await ctx.params;
-  if (!findNote(id)) return jsonError(404, "Note not found.");
+  if (!(await findNote(id))) return jsonError(404, "Note not found.");
 
   const body = await readJson<{ title?: unknown; content?: unknown }>(req);
   if (typeof body?.content !== "string") return jsonError(400, "content is required.");

@@ -82,8 +82,11 @@ logs/
 *.dump
 *.sql.gz
 
-# --- Contexta local data (uploaded PDFs, SQLite, model cache) ---
+# --- Contexta local data (uploaded files, local database, model cache) ---
 /data/
+
+# --- Local docs ---
+/docs/
 
 # --- OS & editor ---
 Thumbs.db

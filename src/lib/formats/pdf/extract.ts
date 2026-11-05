@@ -2,9 +2,11 @@ import "server-only";
 import { extractText, getDocumentProxy } from "unpdf";
 import type { FormatExtractor } from "../types";
 import { pdfMeta } from "./meta";
+import { writePdf } from "./write";
 
 export const pdfExtractor: FormatExtractor = {
   meta: pdfMeta,
+  write: writePdf,
 
   sniff: (bytes) => String.fromCharCode(...bytes.subarray(0, 5)) === "%PDF-",
 

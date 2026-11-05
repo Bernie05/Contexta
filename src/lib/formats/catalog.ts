@@ -9,6 +9,9 @@ export type { DocKind, FormatMeta } from "./types";
 
 export const FORMATS: FormatMeta[] = [pdfMeta, docxMeta, noteMeta];
 
+/** File types a web page can be saved as. */
+export const URL_IMPORT_KINDS: DocKind[] = ["pdf"];
+
 const byKind = new Map(FORMATS.map((f) => [f.kind, f]));
 
 export function formatOf(kind: DocKind): FormatMeta {

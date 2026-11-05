@@ -1,6 +1,6 @@
 export async function register() {
   if (process.env.NEXT_RUNTIME === "nodejs") {
     const { resumeQueue } = await import("./lib/indexer");
-    resumeQueue();
+    await resumeQueue();
   }
 }

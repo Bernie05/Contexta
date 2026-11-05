@@ -1,8 +1,10 @@
 import "server-only";
 import fs from "node:fs/promises";
 import { randomUUID } from "node:crypto";
-import { db, documentsInFolders, filePath, folderSubtree, getDocument } from "./db";
-import type { DocKind } from "./formats/types";
+import { documentsInFolders, filePath, folderSubtree, getDocument, query } from "./db";
+import { formatOf } from "./formats/catalog";
+import { extractorFor } from "./formats/registry";
+import type { DocKind, WrittenDocument } from "./formats/types";
 import { enqueue } from "./indexer";
 import type { Document } from "./types";
 
@@ -18,36 +20,54 @@ export async function createDocument(input: {
 }): Promise<Document> {
   const id = randomUUID();
   await fs.writeFile(filePath(id, input.kind), input.bytes);
-  db()
-    .prepare("INSERT INTO documents (id, name, kind, folder_id, size, status) VALUES (?, ?, ?, ?, ?, 'queued')")
-    .run(id, input.name, input.kind, input.folderId, input.bytes.byteLength);
+  await query("INSERT INTO documents (id, name, kind, folder_id, size, status) VALUES ($1, $2, $3, $4, $5, 'queued')", [
+    id,
+    input.name,
+    input.kind,
+    input.folderId,
+    input.bytes.byteLength,
+  ]);
   enqueue(id);
-  return getDocument(id)!;
+  return (await getDocument(id))!;
+}
+
+/** Writes generated text as a file. It's saved as a note if that format can't show the text. */
+export async function createWrittenDocument(output: WrittenDocument, kind: DocKind, folderId: string | null): Promise<Document> {
+  const file = await extractorFor(kind).write(output);
+  const savedKind = file ? kind : "note";
+  return createDocument({
+    name: savedKind === "note" ? output.title : `${output.title}${formatOf(savedKind).extensions[0]}`,
+    kind: savedKind,
+    folderId,
+    bytes: file ?? (await extractorFor("note").write(output))!,
+  });
 }
 
 /** Replaces a document's content (and optionally its name), then re-indexes it. */
 export async function replaceContent(id: string, bytes: Uint8Array, name?: string): Promise<Document | undefined> {
-  const doc = getDocument(id);
+  const doc = await getDocument(id);
   if (!doc) return undefined;
   await fs.writeFile(filePath(id, doc.kind), bytes);
-  db()
-    .prepare("UPDATE documents SET name = COALESCE(?, name), size = ?, status = 'queued', error = NULL WHERE id = ?")
-    .run(name ?? null, bytes.byteLength, id);
+  await query("UPDATE documents SET name = COALESCE($1, name), size = $2, status = 'queued', error = NULL WHERE id = $3", [
+    name ?? null,
+    bytes.byteLength,
+    id,
+  ]);
   enqueue(id);
   return getDocument(id);
 }
 
 export async function deleteDocument(id: string): Promise<boolean> {
-  const doc = getDocument(id);
+  const doc = await getDocument(id);
   if (!doc) return false;
-  db().prepare("DELETE FROM documents WHERE id = ?").run(id); // cascades to chunks
+  await query("DELETE FROM documents WHERE id = $1", [id]); // cascades to chunks
   await fs.rm(filePath(id, doc.kind), { force: true });
   return true;
 }
 
 /** Deletes a folder with its subfolders and every document inside them. */
 export async function deleteFolder(id: string): Promise<void> {
-  const docs = documentsInFolders(folderSubtree(id));
-  db().prepare("DELETE FROM folders WHERE id = ?").run(id); // cascades to subfolders, documents, chunks
+  const docs = await documentsInFolders(await folderSubtree(id));
+  await query("DELETE FROM folders WHERE id = $1", [id]); // cascades to subfolders, documents, chunks
   await Promise.all(docs.map((d) => fs.rm(filePath(d.id, d.kind), { force: true })));
 }

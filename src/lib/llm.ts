@@ -5,6 +5,10 @@ import type { ModelOption } from "./types";
 import { readLines, readNdjson, trimTrailingSlash } from "./utils";
 
 export type Provider = ModelOption["provider"];
+export type ModelTarget = { provider: Provider; model: string; providerId?: string };
+
+/** Added to an answer when Claude refuses, so callers that save the text can detect it. */
+export const MODEL_REFUSED = "_The model declined to answer this request._";
 
 export interface ChatTurn {
   role: "user" | "assistant";
@@ -21,17 +25,17 @@ const CLAUDE_MODELS: { model: string; label: string }[] = [
 const FALLBACK_MODELS = new Set(["claude-opus-5-5", "claude-sonnet-5-5"]);
 
 export async function listModels(): Promise<{ models: ModelOption[]; claudeConfigured: boolean; ollamaReachable: boolean }> {
-  const claudeConfigured = Boolean(anthropicKey());
+  const claudeConfigured = Boolean(await anthropicKey());
   const models: ModelOption[] = claudeConfigured
     ? CLAUDE_MODELS.map((m) => ({ id: `claude:${m.model}`, provider: "claude", group: "Claude API", ...m }))
     : [];
 
-  const ollama = await listOllamaModels(ollamaUrl());
+  const ollama = await listOllamaModels(await ollamaUrl());
   for (const name of ollama ?? []) {
     models.push({ id: `ollama:${name}`, provider: "ollama", model: name, label: name, group: "Ollama (local)" });
   }
 
-  for (const p of getSettings().providers) {
+  for (const p of (await getSettings()).providers) {
     for (const m of p.models) {
       models.push({ id: `compat:${p.id}:${m}`, provider: "compat", model: m, label: m, group: p.name });
     }
@@ -79,7 +83,7 @@ export async function testAnthropicKey(apiKey: string): Promise<void> {
 }
 
 /** Parses "claude:<model>", "ollama:<model>" or "compat:<providerId>:<model>". */
-export function parseModelId(id: string): { provider: Provider; model: string; providerId?: string } | null {
+export function parseModelId(id: string): ModelTarget | null {
   const i = id.indexOf(":");
   if (i < 0) return null;
   const provider = id.slice(0, i);
@@ -97,7 +101,7 @@ export function parseModelId(id: string): { provider: Provider; model: string; p
 
 /** Streams answer text. Throws on provider errors; the caller reports them to the client. */
 export async function* streamAnswer(
-  target: { provider: Provider; model: string; providerId?: string },
+  target: ModelTarget,
   system: string,
   messages: ChatTurn[],
   signal: AbortSignal,
@@ -105,7 +109,7 @@ export async function* streamAnswer(
   if (target.provider === "claude") yield* streamClaude(target.model, system, messages, signal);
   else if (target.provider === "ollama") yield* streamOllama(target.model, system, messages, signal);
   else {
-    const provider = target.providerId ? findProvider(target.providerId) : undefined;
+    const provider = target.providerId ? await findProvider(target.providerId) : undefined;
     if (!provider) throw new Error("That provider was removed in Settings. Pick another model.");
     yield* streamCompat(provider, target.model, system, messages, signal);
   }
@@ -115,7 +119,7 @@ export async function* streamAnswer(
 let anthropic: { key: string; client: Anthropic } | undefined;
 
 async function* streamClaude(model: string, system: string, messages: ChatTurn[], signal: AbortSignal) {
-  const key = anthropicKey();
+  const key = await anthropicKey();
   if (!key) throw new Error("Add your Anthropic API key in Settings to use Claude.");
   if (anthropic?.key !== key) anthropic = { key, client: new Anthropic({ apiKey: key }) };
 
@@ -140,7 +144,7 @@ async function* streamClaude(model: string, system: string, messages: ChatTurn[]
 
   const final = await stream.finalMessage();
   if (final.stop_reason === "refusal") {
-    yield "\n\n_The model declined to answer this request._";
+    yield `\n\n${MODEL_REFUSED}`;
   } else if (final.stop_reason === "max_tokens") {
     yield "\n\n_Answer was cut off at the token limit._";
   }
@@ -167,7 +171,7 @@ const withSystem = (system: string, messages: ChatTurn[]) => [{ role: "system", 
 async function* streamOllama(model: string, system: string, messages: ChatTurn[], signal: AbortSignal) {
   const body = await postForStream(
     "Ollama",
-    `${ollamaUrl()}/api/chat`,
+    `${await ollamaUrl()}/api/chat`,
     { model, stream: true, messages: withSystem(system, messages) },
     signal,
   );

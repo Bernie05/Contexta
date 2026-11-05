@@ -1,6 +1,6 @@
 import "server-only";
 import { randomUUID } from "node:crypto";
-import { db } from "./db";
+import { query, queryOne } from "./db";
 import { isHttpUrl, trimTrailingSlash } from "./utils";
 import type { PublicSettings, SettingsUpdate } from "./types";
 
@@ -21,9 +21,9 @@ export interface Settings {
 
 const DEFAULTS: Settings = { anthropicApiKey: "", ollamaUrl: "", providers: [] };
 
-// Keys are stored in the local SQLite file (data/ is git-ignored). The app is single-user and local.
-export function getSettings(): Settings {
-  const row = db().prepare("SELECT value FROM settings WHERE key = 'app'").get() as { value: string } | undefined;
+// Keys are stored in the database (data/ is git-ignored locally). The app is single-user.
+export async function getSettings(): Promise<Settings> {
+  const row = await queryOne<{ value: string }>("SELECT value FROM settings WHERE key = 'app'");
   if (!row) return { ...DEFAULTS };
   try {
     return { ...DEFAULTS, ...(JSON.parse(row.value) as Partial<Settings>) };
@@ -32,32 +32,32 @@ export function getSettings(): Settings {
   }
 }
 
-function save(settings: Settings) {
-  db()
-    .prepare("INSERT INTO settings (key, value) VALUES ('app', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
-    .run(JSON.stringify(settings));
+async function save(settings: Settings) {
+  await query("INSERT INTO settings (key, value) VALUES ('app', $1) ON CONFLICT(key) DO UPDATE SET value = excluded.value", [
+    JSON.stringify(settings),
+  ]);
 }
 
 /** Effective values: saved settings win, environment variables are the fallback. */
-export function anthropicKey(): string {
-  return getSettings().anthropicApiKey || process.env.ANTHROPIC_API_KEY || "";
+export async function anthropicKey(): Promise<string> {
+  return (await getSettings()).anthropicApiKey || process.env.ANTHROPIC_API_KEY || "";
 }
 
-export function ollamaUrl(): string {
-  return trimTrailingSlash(getSettings().ollamaUrl || process.env.OLLAMA_URL || "http://localhost:11434");
+export async function ollamaUrl(): Promise<string> {
+  return trimTrailingSlash((await getSettings()).ollamaUrl || process.env.OLLAMA_URL || "http://localhost:11434");
 }
 
 const hint = (key: string) => (key ? `••••${key.slice(-4)}` : "");
 
-export function publicSettings(): PublicSettings {
-  const s = getSettings();
+export async function publicSettings(): Promise<PublicSettings> {
+  const s = await getSettings();
   return {
     anthropic: {
       hasKey: Boolean(s.anthropicApiKey),
       keyHint: hint(s.anthropicApiKey),
       fromEnv: !s.anthropicApiKey && Boolean(process.env.ANTHROPIC_API_KEY),
     },
-    ollamaUrl: ollamaUrl(),
+    ollamaUrl: await ollamaUrl(),
     providers: s.providers.map((p) => ({
       id: p.id,
       name: p.name,
@@ -70,8 +70,8 @@ export function publicSettings(): PublicSettings {
 }
 
 /** Applies an update from the settings form. Throws with a user-facing message on invalid input. */
-export function updateSettings(update: SettingsUpdate): PublicSettings {
-  const current = getSettings();
+export async function updateSettings(update: SettingsUpdate): Promise<PublicSettings> {
+  const current = await getSettings();
   const next: Settings = { ...current };
 
   if (update.anthropicApiKey !== undefined) next.anthropicApiKey = (update.anthropicApiKey ?? "").trim();
@@ -95,10 +95,10 @@ export function updateSettings(update: SettingsUpdate): PublicSettings {
     });
   }
 
-  save(next);
+  await save(next);
   return publicSettings();
 }
 
-export function findProvider(id: string): CompatProvider | undefined {
-  return getSettings().providers.find((p) => p.id === id);
+export async function findProvider(id: string): Promise<CompatProvider | undefined> {
+  return (await getSettings()).providers.find((p) => p.id === id);
 }

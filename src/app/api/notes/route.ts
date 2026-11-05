@@ -12,7 +12,7 @@ export async function POST(req: Request) {
   if (content.length > MAX_NOTE_CHARS) return jsonError(400, "Note is too long.");
 
   const folderId = typeof body?.folderId === "string" ? body.folderId : null;
-  if (folderId && !getFolder(folderId)) return jsonError(404, "Folder not found.");
+  if (folderId && !(await getFolder(folderId))) return jsonError(404, "Folder not found.");
 
   const doc = await createDocument({ name: title, kind: "note", folderId, bytes: new TextEncoder().encode(content) });
   return Response.json(doc, { status: 201 });

@@ -8,12 +8,14 @@ import {
   Folder as FolderIcon,
   FolderInput,
   FolderPlus,
+  Link as LinkIcon,
   Loader2,
   MessageSquare,
   NotebookPen,
   Pencil,
   Plus,
   RefreshCw,
+  Sparkles,
   Trash2,
   Upload,
   X,
@@ -27,7 +29,7 @@ import { ActionMenu, Button, type MenuItem } from "./ui";
 
 export type ItemAction =
   | { kind: "newSubfolder" | "renameFolder" | "deleteFolder" | "moveFolder"; folder: Folder }
-  | { kind: "renameDoc" | "deleteDoc" | "moveDoc" | "reindex" | "ask" | "openNote"; doc: Document };
+  | { kind: "renameDoc" | "deleteDoc" | "moveDoc" | "reindex" | "ask" | "openNote" | "summarize"; doc: Document };
 
 /** Menu entries for a folder, shared by the document list and the sidebar tree. */
 export function folderMenu(folder: Folder, onAction: (a: ItemAction) => void): MenuItem[] {
@@ -51,6 +53,7 @@ interface Props {
   onOpenFolder: (id: string | null) => void;
   onNewFolder: () => void;
   onNewNote: () => void;
+  onImportUrl: () => void;
   onUpload: (files: File[]) => void;
   onDrop: (e: React.DragEvent, targetId: string | null) => void;
   onAction: (action: ItemAction) => void;
@@ -68,6 +71,7 @@ export function DocumentPane({
   onOpenFolder,
   onNewFolder,
   onNewNote,
+  onImportUrl,
   onUpload,
   onDrop,
   onAction,
@@ -140,6 +144,7 @@ export function DocumentPane({
             }
             items={[
               { label: "Note", icon: <NotebookPen size={14} />, onSelect: onNewNote },
+              { label: "From URL", icon: <LinkIcon size={14} />, onSelect: onImportUrl },
               { label: "Folder", icon: <FolderPlus size={14} />, onSelect: onNewFolder },
             ]}
           />
@@ -337,6 +342,12 @@ function DocumentRow({
                 icon: <ExternalLink size={14} />,
                 onSelect: () => window.open(api.fileUrl(doc.id), "_blank"),
               },
+          {
+            label: "Create summary",
+            icon: <Sparkles size={14} />,
+            disabled: doc.status !== "ready",
+            onSelect: () => onAction({ kind: "summarize", doc }),
+          },
           { label: "Rename", icon: <Pencil size={14} />, onSelect: () => onAction({ kind: "renameDoc", doc }) },
           { label: "Move to…", icon: <FolderInput size={14} />, onSelect: () => onAction({ kind: "moveDoc", doc }) },
           { label: "Re-index", icon: <RefreshCw size={14} />, disabled: busy, onSelect: () => onAction({ kind: "reindex", doc }) },

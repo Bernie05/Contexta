@@ -1,6 +1,9 @@
 // Browser-side helpers for the Contexta API.
-import type { Document, Folder, ModelOption, PublicSettings, RoutedDoc, SettingsUpdate, SourceRef } from "./types";
+import type { DocKind, Document, Folder, ModelOption, PublicSettings, RoutedDoc, SettingsUpdate, SourceRef } from "./types";
 import { readNdjson } from "./utils";
+
+/** localStorage key for the model picked in chat. */
+export const MODEL_KEY = "contexta:model";
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const res = await fetch(url, init);
@@ -41,6 +44,8 @@ export const api = {
     request<Document>("/api/notes", json("POST", note)),
   getNote: (id: string) => request<Document & { content: string }>(`/api/notes/${id}`),
   saveNote: (id: string, note: { title: string; content: string }) => request<Document>(`/api/notes/${id}`, json("PUT", note)),
+  importUrl: (body: { url: string; kind: DocKind; folderId: string | null }) =>
+    request<Document>("/api/documents/from-url", json("POST", body)),
   deleteDocument: (id: string) => request<void>(`/api/documents/${id}`, { method: "DELETE" }),
   reindex: (id: string) => request<Document>(`/api/documents/${id}/reindex`, { method: "POST" }),
   settings: () => request<PublicSettings>("/api/settings"),
@@ -62,17 +67,28 @@ export type ChatEvent =
   | { type: "done" }
   | { type: "error"; error: string };
 
-export async function* chatStream(
-  body: { model: string; folderId: string | null; messages: { role: "user" | "assistant"; content: string }[] },
-  signal: AbortSignal,
-): AsyncGenerator<ChatEvent> {
-  const res = await fetch("/api/chat", { ...json("POST", body), signal });
+export type SummaryEvent =
+  | { type: "progress"; percent: number; part?: number; total?: number }
+  | { type: "done"; document: Document }
+  | { type: "error"; error: string };
+
+async function* postEvents<T>(url: string, body: unknown, signal?: AbortSignal): AsyncGenerator<T> {
+  const res = await fetch(url, { ...json("POST", body), signal });
   if (!res.ok || !res.body) {
     const err = (await res.json().catch(() => null)) as { error?: string } | null;
-    throw new Error(err?.error ?? `Chat failed (${res.status})`);
+    throw new Error(err?.error ?? `Request failed (${res.status})`);
   }
-  yield* readNdjson<ChatEvent>(res.body);
+  yield* readNdjson<T>(res.body);
 }
+
+export const chatStream = (
+  body: { model: string; folderId: string | null; messages: { role: "user" | "assistant"; content: string }[] },
+  signal: AbortSignal,
+) => postEvents<ChatEvent>("/api/chat", body, signal);
+
+/** Creates a summary note with the model picked in chat. The server falls back to the first available one. */
+export const summaryStream = (id: string, model: string | null) =>
+  postEvents<SummaryEvent>(`/api/documents/${id}/summary`, { model });
 
 // Drag payload for moving folders and documents inside the app (one item, or the whole selection).
 export const DRAG_MIME = "application/x-contexta-items";

@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import { ArrowUp, Bot, FileText, Loader2, Minus, NotebookPen, Settings, Sparkles, Square, Trash2, X } from "lucide-react";
-import { api, chatStream } from "@/lib/api";
+import { api, chatStream, MODEL_KEY } from "@/lib/api";
 import { partLabel } from "@/lib/formats/catalog";
 import { errorMessage, readLocal, writeLocal } from "@/lib/utils";
 import type { ModelOption, RoutedDoc, SourceRef } from "@/lib/types";
@@ -16,10 +16,9 @@ interface Message {
   error?: string;
 }
 
-const MODEL_KEY = "contexta:model";
-
 const REASON_LABEL: Record<RoutedDoc["reasons"][number], string> = {
   content: "content matches the question",
+  keyword: "contains words from the question",
   name: "file name matches",
   folder: "in the folder you have open",
 };

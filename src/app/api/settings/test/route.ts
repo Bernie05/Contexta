@@ -18,7 +18,7 @@ export async function POST(req: Request) {
 
   try {
     if (body.kind === "anthropic") {
-      const key = body.apiKey?.trim() || anthropicKey();
+      const key = body.apiKey?.trim() || (await anthropicKey());
       if (!key) return jsonError(400, "Enter an API key first.");
       await testAnthropicKey(key);
       return Response.json({ ok: true, message: "Key works." });
@@ -35,7 +35,7 @@ export async function POST(req: Request) {
     if (body.kind === "compat") {
       const baseUrl = body.baseUrl?.trim();
       if (!baseUrl || !isHttpUrl(baseUrl)) return jsonError(400, "Enter a base URL starting with http:// or https://");
-      const key = body.apiKey?.trim() || (body.providerId ? (findProvider(body.providerId)?.apiKey ?? "") : "");
+      const key = body.apiKey?.trim() || (body.providerId ? ((await findProvider(body.providerId))?.apiKey ?? "") : "");
       const models = await listCompatModels(baseUrl, key);
       return Response.json({ ok: true, message: `Connected. ${plural(models.length, "model")} available.`, models });
     }
